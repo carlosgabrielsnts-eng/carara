@@ -1,478 +1,503 @@
-
 require('dotenv').config();
 const express = require('express');
-const admin = require('firebase-admin');
-const fs = require('fs');
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const admin = require('firebase-admin');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 const PORT = Number(process.env.PORT || 3000);
-const FIREBASE_DATABASE_URL = process.env.FIREBASE_DATABASE_URL || '';
-const WORKER_INTERVAL_MS = Number(process.env.WORKER_INTERVAL_MS || 15000);
+const APP_NAME = process.env.APP_NAME || 'Argos RJ Backend';
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://argosrj.netlify.app').replace(/\/+$/,'');
+const DISCORD_CLIENT_ID = (process.env.DISCORD_CLIENT_ID || '').trim();
+const DISCORD_CLIENT_SECRET = (process.env.DISCORD_CLIENT_SECRET || '').trim();
+const DISCORD_REDIRECT_URI = (process.env.DISCORD_REDIRECT_URI || 'http://argosrj.netlify.app/auth/discord/callback').trim();
+const FIREBASE_DATABASE_URL = (process.env.FIREBASE_DATABASE_URL || '').trim();
 const MP_ACCESS_TOKEN = (process.env.MP_ACCESS_TOKEN || '').trim();
-const MP_PUBLIC_KEY = (process.env.MP_PUBLIC_KEY || '').trim();
-const MP_WEBHOOK_URL = (process.env.MP_WEBHOOK_URL || '').trim();
+const MP_WEBHOOK_SECRET = (process.env.MP_WEBHOOK_SECRET || '').trim();
+const WORKER_INTERVAL_MS = Number(process.env.WORKER_INTERVAL_MS || 15000);
 
-const logs = [];
-function addLog(level, message, extra) {
-  const row = { time: new Date().toISOString(), level, message, extra: extra || null };
-  logs.unshift(row);
-  if (logs.length > 300) logs.pop();
-  const text = `[${row.time}] [${level.toUpperCase()}] ${message}${extra ? ' ' + JSON.stringify(extra) : ''}`;
-  if (level === 'error') console.error(text);
-  else console.log(text);
+const runtime = {
+  startedAt: new Date().toISOString(),
+  logs: [],
+  worker: { running:false, lastRunAt:null, lastError:null, lastSummary:null }
+};
+
+function addLog(level, message, extra=null){
+  const row = { time:new Date().toISOString(), level, message, extra };
+  runtime.logs.unshift(row);
+  if(runtime.logs.length > 250) runtime.logs.pop();
+  const line = `[${row.time}] [${level.toUpperCase()}] ${message}${extra ? ' ' + JSON.stringify(extra) : ''}`;
+  if(level === 'error') console.error(line); else console.log(line);
 }
 
-function readServiceAccount() {
-  const candidates = [
+function escapeHtml(value=''){
+  return String(value)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'","&#39;");
+}
+
+function readServiceAccount(){
+  const fileCandidates = [
     process.env.GOOGLE_APPLICATION_CREDENTIALS,
     process.env.SERVICE_ACCOUNT_FILE,
     '/etc/secrets/serviceAccount.json',
     path.join(__dirname, 'serviceAccount.json')
   ].filter(Boolean);
 
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) {
-        return { json: JSON.parse(fs.readFileSync(p, 'utf8')), source: p };
+  for(const file of fileCandidates){
+    try{
+      if(fs.existsSync(file)){
+        return { json: JSON.parse(fs.readFileSync(file, 'utf8')), source:file };
       }
-    } catch (err) {
-      addLog('error', 'Falha ao ler service account', { path: p, error: err.message });
+    }catch(err){
+      addLog('error', 'Falha ao ler service account file', { file, error: err.message });
     }
   }
 
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    try {
-      return { json: JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON), source: 'FIREBASE_SERVICE_ACCOUNT_JSON' };
-    } catch (err) {
+  if(process.env.FIREBASE_SERVICE_ACCOUNT_JSON){
+    try{
+      return { json: JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON), source:'FIREBASE_SERVICE_ACCOUNT_JSON' };
+    }catch(err){
       addLog('error', 'FIREBASE_SERVICE_ACCOUNT_JSON inválido', { error: err.message });
     }
   }
+
   return null;
 }
 
-let firebaseReady = false;
-let firebaseSource = null;
-let db = null;
-
-try {
+const firebaseState = { connected:false, source:null, db:null };
+try{
   const sa = readServiceAccount();
-  if (sa && FIREBASE_DATABASE_URL) {
+  if(sa && FIREBASE_DATABASE_URL){
     admin.initializeApp({
       credential: admin.credential.cert(sa.json),
       databaseURL: FIREBASE_DATABASE_URL
     });
-    db = admin.database();
-    firebaseReady = true;
-    firebaseSource = sa.source;
-    addLog('info', 'Firebase Admin conectado.', { source: firebaseSource });
-  } else {
-    addLog('warn', 'Firebase Admin não iniciado.', {
-      hasServiceAccount: !!sa,
-      hasDatabaseUrl: !!FIREBASE_DATABASE_URL
-    });
+    firebaseState.connected = true;
+    firebaseState.source = sa.source;
+    firebaseState.db = admin.database();
+    addLog('info', 'Firebase Admin conectado', { source: sa.source });
+  }else{
+    addLog('warn', 'Firebase Admin pendente', { hasServiceAccount: !!sa, hasDatabaseUrl: !!FIREBASE_DATABASE_URL });
   }
-} catch (err) {
-  addLog('error', 'Erro ao iniciar Firebase Admin.', { error: err.message });
+}catch(err){
+  addLog('error', 'Erro ao iniciar Firebase Admin', { error: err.message });
 }
 
-let worker = {
-  running: false,
-  lastRunAt: null,
-  lastError: null,
-  lastSummary: null
-};
+async function dbGet(refPath){
+  if(!firebaseState.connected) return null;
+  const snap = await firebaseState.db.ref(refPath).get();
+  return snap.exists() ? snap.val() : null;
+}
+async function dbSet(refPath, value){
+  if(!firebaseState.connected) throw new Error('Firebase não conectado');
+  await firebaseState.db.ref(refPath).set(value);
+}
+async function dbUpdate(refPath, value){
+  if(!firebaseState.connected) throw new Error('Firebase não conectado');
+  await firebaseState.db.ref(refPath).update(value);
+}
 
-async function mpFetch(url, options) {
-  const response = await fetch(url, options);
-  const text = await response.text();
+async function apiFetch(url, options={}){
+  const res = await fetch(url, options);
+  const text = await res.text();
   let json = null;
-  try { json = JSON.parse(text); } catch (_) {}
-  return { response, text, json };
+  try{ json = JSON.parse(text); }catch{}
+  return { res, text, json };
 }
 
-async function createPixPayment(order) {
-  const idempotency = `argos_${order.discordId}_${order.orderId}`;
+async function getDiscordAuthUrl(state, redirectUri){
+  const authUrl = new URL('https://discord.com/oauth2/authorize');
+  authUrl.searchParams.set('client_id', DISCORD_CLIENT_ID);
+  authUrl.searchParams.set('response_type', 'code');
+  authUrl.searchParams.set('scope', 'identify email');
+  authUrl.searchParams.set('redirect_uri', redirectUri || DISCORD_REDIRECT_URI);
+  if(state) authUrl.searchParams.set('state', state);
+  return String(authUrl);
+}
+
+async function exchangeDiscordCode(code, redirectUri){
+  const body = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    client_secret: DISCORD_CLIENT_SECRET,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri || DISCORD_REDIRECT_URI
+  });
+
+  const tokenRes = await apiFetch('https://discord.com/api/v10/oauth2/token', {
+    method:'POST',
+    headers:{ 'Content-Type':'application/x-www-form-urlencoded' },
+    body
+  });
+
+  if(!tokenRes.res.ok || !tokenRes.json?.access_token){
+    throw new Error(`Discord token error: ${tokenRes.text}`);
+  }
+
+  const meRes = await apiFetch('https://discord.com/api/v10/users/@me', {
+    headers:{ Authorization:`Bearer ${tokenRes.json.access_token}` }
+  });
+  if(!meRes.res.ok || !meRes.json?.id){
+    throw new Error(`Discord user error: ${meRes.text}`);
+  }
+
+  const me = meRes.json;
+  return {
+    access_token: tokenRes.json.access_token,
+    user: {
+      id: me.id,
+      username: me.username,
+      global_name: me.global_name || me.username,
+      email: me.email || '',
+      discriminator: me.discriminator || me.id,
+      avatar_url: me.avatar ? `https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png?size=256` : ''
+    }
+  };
+}
+
+async function createPixPayment(order){
   const payload = {
-    transaction_amount: Number(order.total || order.amount || order.price || 0),
-    description: order.description || `Pedido Argos RJ #${order.orderId}`,
+    transaction_amount: Number(order.total || 0),
+    description: order.description || `Pedido Argos RJ ${order.orderId}`,
     payment_method_id: 'pix',
     payer: {
-      email: order.email || 'comprador@argosrj.local',
-      first_name: order.first_name || 'Player',
-      last_name: order.last_name || 'Argos'
+      email: order.buyerEmail || 'comprador@argosrj.local',
+      first_name: order.discordUsername || 'Player',
+      last_name: 'Argos'
     },
     external_reference: order.orderId,
-    notification_url: MP_WEBHOOK_URL || undefined
+    notification_url: process.env.MP_WEBHOOK_URL || undefined
   };
 
-  return mpFetch('https://api.mercadopago.com/v1/payments', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
-      'Content-Type': 'application/json',
-      'X-Idempotency-Key': idempotency
+  return apiFetch('https://api.mercadopago.com/v1/payments', {
+    method:'POST',
+    headers:{
+      Authorization:`Bearer ${MP_ACCESS_TOKEN}`,
+      'Content-Type':'application/json',
+      'X-Idempotency-Key': `argos_${order.discordId}_${order.orderId}`
     },
     body: JSON.stringify(payload)
   });
 }
 
-async function getValue(refPath) {
-  if (!firebaseReady) return null;
-  const snap = await db.ref(refPath).get();
-  return snap.exists() ? snap.val() : null;
+function paymentFieldsFromMp(mp){
+  const tx = mp?.point_of_interaction?.transaction_data || mp?.transaction_data || {};
+  return {
+    id: mp?.id || null,
+    status: mp?.status || null,
+    status_detail: mp?.status_detail || null,
+    qr_code: tx?.qr_code || null,
+    qr_code_base64: tx?.qr_code_base64 || null,
+    ticket_url: tx?.ticket_url || null,
+    date_of_expiration: mp?.date_of_expiration || null,
+    updatedAt: new Date().toISOString()
+  };
 }
 
-async function setValue(refPath, value) {
-  if (!firebaseReady) throw new Error('Firebase não conectado');
-  await db.ref(refPath).set(value);
-}
-
-async function updateValue(refPath, value) {
-  if (!firebaseReady) throw new Error('Firebase não conectado');
-  await db.ref(refPath).update(value);
-}
-
-async function processPendingOrders() {
-  const siteOrders = await getValue('siteOrders');
-  let created = 0, skipped = 0, checked = 0, approved = 0;
-
-  if (!siteOrders || typeof siteOrders !== 'object') {
-    return { created, skipped, checked, approved, message: 'Sem pedidos no banco.' };
-  }
-
-  for (const [discordId, bucket] of Object.entries(siteOrders)) {
-    if (!bucket || typeof bucket !== 'object') continue;
-
-    for (const [orderId, order] of Object.entries(bucket)) {
-      checked += 1;
-      const status = String(order.status || 'pending').toLowerCase();
-
-      if (status === 'paid' || status === 'approved') {
-        approved += 1;
-        continue;
-      }
-
-      const hasPayment = !!(order.payment && order.payment.id);
-      if (hasPayment) {
-        skipped += 1;
-        continue;
-      }
-
-      if (!MP_ACCESS_TOKEN) {
-        skipped += 1;
-        await updateValue(`siteOrders/${discordId}/${orderId}`, {
-          backendStatus: 'missing_mp_token',
-          updatedAt: new Date().toISOString()
-        });
-        continue;
-      }
-
-      const { response, text, json } = await createPixPayment({ ...order, discordId, orderId });
-
-      if (!response.ok) {
-        addLog('error', 'Mercado Pago recusou criação do pagamento.', {
-          orderId, discordId, status: response.status, body: json || text.slice(0, 400)
-        });
-        await updateValue(`siteOrders/${discordId}/${orderId}`, {
-          backendStatus: 'mp_error',
-          backendError: json || text,
-          updatedAt: new Date().toISOString()
-        });
-        continue;
-      }
-
-      const tx = json && json.point_of_interaction && json.point_of_interaction.transaction_data
-        ? json.point_of_interaction.transaction_data
-        : (json && json.transaction_data ? json.transaction_data : null);
-
-      await updateValue(`siteOrders/${discordId}/${orderId}`, {
-        status: json.status || 'pending',
-        backendStatus: 'pix_generated',
-        payment: {
-          id: json.id || null,
-          status: json.status || null,
-          status_detail: json.status_detail || null,
-          qr_code: tx ? tx.qr_code || null : null,
-          qr_code_base64: tx ? tx.qr_code_base64 || null : null,
-          ticket_url: tx ? tx.ticket_url || null : null,
-          date_of_expiration: json.date_of_expiration || null,
-          public_key_present: !!MP_PUBLIC_KEY,
-          createdAt: new Date().toISOString()
-        },
-        updatedAt: new Date().toISOString()
-      });
-
-      addLog('info', 'PIX gerado para pedido.', { discordId, orderId, paymentId: json.id });
-      created += 1;
+async function processOrdersWorker(){
+  runtime.worker.running = true;
+  runtime.worker.lastRunAt = new Date().toISOString();
+  let checked = 0, generated = 0, skipped = 0, failures = 0;
+  try{
+    const siteOrders = await dbGet('siteOrders');
+    if(!siteOrders || typeof siteOrders !== 'object'){
+      runtime.worker.lastSummary = { checked, generated, skipped, failures, message:'Sem pedidos no Firebase' };
+      return runtime.worker.lastSummary;
     }
-  }
 
-  return { created, skipped, checked, approved };
-}
-
-async function countUsersAndOrders() {
-  const users = await getValue('siteUsers');
-  const orders = await getValue('siteOrders');
-  let usersCount = users && typeof users === 'object' ? Object.keys(users).length : 0;
-  let ordersCount = 0;
-  if (orders && typeof orders === 'object') {
-    for (const bucket of Object.values(orders)) {
-      if (bucket && typeof bucket === 'object') ordersCount += Object.keys(bucket).length;
-    }
-  }
-  return { usersCount, ordersCount };
-}
-
-async function runWorker() {
-  worker.running = true;
-  worker.lastRunAt = new Date().toISOString();
-  worker.lastError = null;
-  try {
-    if (!firebaseReady) {
-      worker.lastSummary = { message: 'Firebase não conectado.' };
-      return;
-    }
-    const orderSummary = await processPendingOrders();
-    const counts = await countUsersAndOrders();
-    worker.lastSummary = { ...orderSummary, ...counts };
-  } catch (err) {
-    worker.lastError = err.message;
-    addLog('error', 'Worker falhou.', { error: err.message });
-  } finally {
-    worker.running = false;
-  }
-}
-
-app.get('/', (req, res) => res.redirect('/admin'));
-
-app.get('/api/health', async (req, res) => {
-  const counts = firebaseReady ? await countUsersAndOrders() : { usersCount: null, ordersCount: null };
-  res.json({
-    ok: true,
-    backendOnline: true,
-    firebaseReady,
-    firebaseSource,
-    firebaseDatabaseUrlConfigured: !!FIREBASE_DATABASE_URL,
-    mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
-    mercadoPagoPublicKeyConfigured: !!MP_PUBLIC_KEY,
-    worker,
-    counts,
-    callbackHint: 'Use o frontend Netlify para login/auth. Este backend gera PIX e grava no Firebase.',
-    logs: logs.slice(0, 50)
-  });
-});
-
-app.get('/api/admin/status', async (req, res) => {
-  const counts = firebaseReady ? await countUsersAndOrders() : { usersCount: null, ordersCount: null };
-  let recentOrders = [];
-  if (firebaseReady) {
-    const allOrders = await getValue('siteOrders');
-    if (allOrders && typeof allOrders === 'object') {
-      for (const [discordId, bucket] of Object.entries(allOrders)) {
-        if (!bucket || typeof bucket !== 'object') continue;
-        for (const [orderId, order] of Object.entries(bucket)) {
-          recentOrders.push({ discordId, orderId, ...(order || {}) });
+    for(const [discordId, bucket] of Object.entries(siteOrders)){
+      if(!bucket || typeof bucket !== 'object') continue;
+      for(const [orderId, order] of Object.entries(bucket)){
+        checked += 1;
+        const orderStatus = String(order?.status || 'pending').toLowerCase();
+        if(order?.payment?.id || ['approved','paid'].includes(orderStatus)){
+          skipped += 1;
+          continue;
         }
-      }
-      recentOrders = recentOrders.slice(0, 20);
-    }
-  }
-  res.json({
-    ok: true,
-    backendOnline: true,
-    firebaseReady,
-    firebaseSource,
-    firebaseDatabaseUrlConfigured: !!FIREBASE_DATABASE_URL,
-    mercadoPagoConfigured: !!MP_ACCESS_TOKEN,
-    mercadoPagoPublicKeyConfigured: !!MP_PUBLIC_KEY,
-    worker,
-    counts,
-    recentOrders,
-    logs: logs.slice(0, 80)
-  });
-});
-
-app.post('/api/admin/run-worker', async (req, res) => {
-  await runWorker();
-  res.json({ ok: true, worker });
-});
-
-app.post('/api/mercadopago/webhook', async (req, res) => {
-  try {
-    addLog('info', 'Webhook Mercado Pago recebido.', { body: req.body });
-    const dataId = req.body && req.body.data && req.body.data.id ? String(req.body.data.id) : null;
-    const topic = req.body && (req.body.type || req.body.topic) ? String(req.body.type || req.body.topic) : null;
-
-    if (!dataId || !(topic === 'payment' || topic === 'payments')) {
-      return res.status(200).json({ ok: true, ignored: true });
-    }
-
-    if (!MP_ACCESS_TOKEN) {
-      return res.status(200).json({ ok: true, ignored: true, reason: 'missing_mp_token' });
-    }
-
-    const { response, text, json } = await mpFetch(`https://api.mercadopago.com/v1/payments/${dataId}`, {
-      headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
-    });
-
-    if (!response.ok) {
-      addLog('error', 'Falha ao consultar pagamento do webhook.', { paymentId: dataId, status: response.status, body: json || text });
-      return res.status(200).json({ ok: true, ignored: true, reason: 'payment_lookup_failed' });
-    }
-
-    const externalRef = json.external_reference || null;
-    if (!externalRef || !firebaseReady) {
-      return res.status(200).json({ ok: true, ignored: true, reason: 'missing_external_reference_or_firebase' });
-    }
-
-    const siteOrders = await getValue('siteOrders');
-    if (siteOrders && typeof siteOrders === 'object') {
-      for (const [discordId, bucket] of Object.entries(siteOrders)) {
-        if (!bucket || typeof bucket !== 'object') continue;
-        if (bucket[externalRef]) {
-          await updateValue(`siteOrders/${discordId}/${externalRef}`, {
-            status: json.status || bucket[externalRef].status || 'pending',
-            payment: {
-              ...(bucket[externalRef].payment || {}),
-              id: json.id || null,
-              status: json.status || null,
-              status_detail: json.status_detail || null,
-              updatedAt: new Date().toISOString()
-            },
+        if(!MP_ACCESS_TOKEN){
+          skipped += 1;
+          await dbUpdate(`siteOrders/${discordId}/${orderId}`, {
+            backendStatus:'missing_mp_token',
             updatedAt: new Date().toISOString()
           });
-          addLog('info', 'Pedido atualizado via webhook.', { discordId, orderId: externalRef, status: json.status });
-          break;
+          continue;
+        }
+
+        const mpRes = await createPixPayment({ ...order, discordId, orderId });
+        if(!mpRes.res.ok){
+          failures += 1;
+          addLog('error', 'Mercado Pago recusou criação do pagamento', { discordId, orderId, status: mpRes.res.status, body: mpRes.json || mpRes.text });
+          await dbUpdate(`siteOrders/${discordId}/${orderId}`, {
+            backendStatus:'mp_error',
+            backendError: mpRes.json || mpRes.text,
+            updatedAt: new Date().toISOString()
+          });
+          continue;
+        }
+
+        await dbUpdate(`siteOrders/${discordId}/${orderId}`, {
+          status: mpRes.json?.status || 'pending',
+          backendStatus:'pix_generated',
+          payment: paymentFieldsFromMp(mpRes.json),
+          updatedAt: new Date().toISOString()
+        });
+        generated += 1;
+      }
+    }
+
+    runtime.worker.lastSummary = { checked, generated, skipped, failures };
+    addLog('info', 'Worker concluído', runtime.worker.lastSummary);
+    return runtime.worker.lastSummary;
+  }catch(err){
+    failures += 1;
+    runtime.worker.lastError = err.message;
+    runtime.worker.lastSummary = { checked, generated, skipped, failures, error: err.message };
+    addLog('error', 'Erro no worker', { error: err.message });
+    return runtime.worker.lastSummary;
+  }finally{
+    runtime.worker.running = false;
+  }
+}
+
+setInterval(() => {
+  processOrdersWorker().catch(err => addLog('error', 'Loop do worker falhou', { error: err.message }));
+}, WORKER_INTERVAL_MS);
+
+async function collectStats(){
+  const users = await dbGet('siteUsers');
+  const orders = await dbGet('siteOrders');
+
+  const usersCount = users && typeof users === 'object' ? Object.keys(users).length : 0;
+  let ordersCount = 0;
+  const recentOrders = [];
+  if(orders && typeof orders === 'object'){
+    for(const [discordId, bucket] of Object.entries(orders)){
+      if(!bucket || typeof bucket !== 'object') continue;
+      for(const [orderId, order] of Object.entries(bucket)){
+        ordersCount += 1;
+        recentOrders.push({
+          discordId, orderId,
+          total: Number(order.total || 0),
+          status: order.payment?.status || order.status || 'pending',
+          createdAt: order.createdAt || null
+        });
+      }
+    }
+  }
+
+  recentOrders.sort((a,b)=> new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  return { usersCount, ordersCount, recentOrders: recentOrders.slice(0, 12) };
+}
+
+function pageTemplate(title, body){
+  return `<!doctype html>
+  <html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>${escapeHtml(title)}</title>
+    <style>
+      :root{--bg:#0b0d11;--card:#131923;--line:#263043;--text:#eef4ff;--muted:#93a0b8;--brand:#cda45e;--ok:#34c07b;--warn:#efb34a;--bad:#ff7373}
+      *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#131824 0,#0b0d11 55%);color:var(--text);font:16px/1.45 Inter,system-ui,Arial,sans-serif}
+      .wrap{width:min(1200px,calc(100% - 32px));margin:0 auto;padding:24px 0 42px}
+      .top{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}
+      .brand{font-weight:800;font-size:1.3rem}.small{color:var(--muted)} .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+      .card{background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(255,255,255,.015));border:1px solid rgba(255,255,255,.06);border-radius:22px;padding:18px}
+      .status{display:inline-flex;align-items:center;padding:8px 10px;border-radius:999px;font-size:.95rem}
+      .success{background:rgba(52,192,123,.12);color:#b7f1d2}.warning{background:rgba(239,179,74,.12);color:#ffe0a8}.danger{background:rgba(255,115,115,.12);color:#ffd3d3}
+      table{width:100%;border-collapse:collapse}th,td{padding:12px 10px;border-bottom:1px solid rgba(255,255,255,.06);text-align:left}th{color:var(--muted);font-weight:600}
+      a.btn,button.btn{display:inline-flex;padding:12px 15px;border-radius:14px;background:linear-gradient(135deg,var(--brand),#e1bf84);color:#111;text-decoration:none;font-weight:800;border:0}
+      .logs{max-height:420px;overflow:auto;background:#0c1118;border-radius:18px;padding:12px;border:1px solid rgba(255,255,255,.06)}
+      .log{padding:8px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+      @media(max-width:980px){.grid{grid-template-columns:1fr}}
+    </style>
+  </head><body><div class="wrap">${body}</div></body></html>`;
+}
+
+app.get('/', async (req, res) => {
+  const stats = firebaseState.connected ? await collectStats() : { usersCount:0, ordersCount:0, recentOrders:[] };
+  const body = `
+    <div class="top">
+      <div><div class="brand">${escapeHtml(APP_NAME)}</div><div class="small">Página inicial útil, sem "Cannot GET /".</div></div>
+      <div><a class="btn" href="/admin">Abrir admin</a></div>
+    </div>
+    <div style="height:18px"></div>
+    <div class="grid">
+      <div class="card"><div class="small">Firebase</div><h2>${firebaseState.connected ? 'Conectado' : 'Pendente'}</h2><div class="${firebaseState.connected ? 'status success':'status warning'}">${firebaseState.connected ? escapeHtml(firebaseState.source || 'service account') : 'Configuração ausente'}</div></div>
+      <div class="card"><div class="small">Mercado Pago</div><h2>${MP_ACCESS_TOKEN ? 'Configurado' : 'Pendente'}</h2><div class="${MP_ACCESS_TOKEN ? 'status success':'status warning'}">${MP_ACCESS_TOKEN ? 'Token secreto presente' : 'MP_ACCESS_TOKEN ausente'}</div></div>
+      <div class="card"><div class="small">Usuários</div><h2>${stats.usersCount}</h2><div class="small">siteUsers</div></div>
+      <div class="card"><div class="small">Pedidos</div><h2>${stats.ordersCount}</h2><div class="small">siteOrders</div></div>
+    </div>
+    <div style="height:18px"></div>
+    <div class="card">
+      <h3>Rotas principais</h3>
+      <table><tr><th>Rota</th><th>Função</th></tr>
+        <tr><td>/admin</td><td>Painel visual com monitoramento</td></tr>
+        <tr><td>/api/health</td><td>Healthcheck do backend</td></tr>
+        <tr><td>/auth/discord/url</td><td>URL segura do login Discord</td></tr>
+        <tr><td>/auth/discord/exchange</td><td>Troca do code por usuário</td></tr>
+        <tr><td>/webhooks/mercadopago</td><td>Recebe notificações do Mercado Pago</td></tr>
+      </table>
+    </div>`;
+  res.type('html').send(pageTemplate(APP_NAME, body));
+});
+
+app.get('/admin', async (req, res) => {
+  const stats = firebaseState.connected ? await collectStats() : { usersCount:0, ordersCount:0, recentOrders:[] };
+  const logsHtml = runtime.logs.map(row => `<div class="log"><strong>[${escapeHtml(row.level.toUpperCase())}]</strong> ${escapeHtml(row.message)}<div class="small">${escapeHtml(row.time)} ${row.extra ? '• ' + escapeHtml(JSON.stringify(row.extra)) : ''}</div></div>`).join('');
+  const ordersHtml = stats.recentOrders.map(row => `<tr><td>${escapeHtml(row.orderId)}</td><td>${escapeHtml(row.discordId)}</td><td>${escapeHtml(String(row.status))}</td><td>R$ ${Number(row.total).toFixed(2)}</td><td>${escapeHtml(row.createdAt || '—')}</td></tr>`).join('');
+  const body = `
+    <div class="top">
+      <div><div class="brand">/admin • ${escapeHtml(APP_NAME)}</div><div class="small">Monitoramento do backend, Firebase, Mercado Pago, pedidos e worker.</div></div>
+      <div class="small">Iniciado em ${escapeHtml(runtime.startedAt)}</div>
+    </div>
+    <div style="height:18px"></div>
+    <div class="grid">
+      <div class="card"><div class="small">Firebase</div><h2>${firebaseState.connected ? 'Conectado' : 'Pendente'}</h2><div class="${firebaseState.connected ? 'status success':'status warning'}">${firebaseState.connected ? escapeHtml(firebaseState.source || 'ok') : 'service account/databaseURL ausente'}</div></div>
+      <div class="card"><div class="small">Mercado Pago</div><h2>${MP_ACCESS_TOKEN ? 'OK' : 'Pendente'}</h2><div class="${MP_ACCESS_TOKEN ? 'status success':'status warning'}">${MP_ACCESS_TOKEN ? 'MP_ACCESS_TOKEN detectado' : 'Sem token'}</div></div>
+      <div class="card"><div class="small">Worker</div><h2>${runtime.worker.lastRunAt ? 'Ativo' : 'Aguardando'}</h2><div class="small">Última execução: ${escapeHtml(runtime.worker.lastRunAt || '—')}</div><div class="small">Resumo: ${escapeHtml(JSON.stringify(runtime.worker.lastSummary || {}))}</div></div>
+      <div class="card"><div class="small">Frontend</div><h2>${escapeHtml(FRONTEND_URL)}</h2><div class="small">Callback Discord: ${escapeHtml(DISCORD_REDIRECT_URI)}</div></div>
+    </div>
+    <div style="height:18px"></div>
+    <div class="card">
+      <h3>Pedidos recentes</h3>
+      <table><thead><tr><th>Order ID</th><th>Discord ID</th><th>Status</th><th>Total</th><th>Criado em</th></tr></thead><tbody>${ordersHtml || '<tr><td colspan="5">Sem pedidos ainda.</td></tr>'}</tbody></table>
+    </div>
+    <div style="height:18px"></div>
+    <div class="card">
+      <h3>Logs</h3>
+      <div class="logs">${logsHtml || '<div class="small">Sem logs ainda.</div>'}</div>
+    </div>`;
+  res.type('html').send(pageTemplate(`${APP_NAME} /admin`, body));
+});
+
+app.get('/api/health', async (req, res) => {
+  let stats = { usersCount:0, ordersCount:0 };
+  if(firebaseState.connected){
+    const s = await collectStats();
+    stats.usersCount = s.usersCount;
+    stats.ordersCount = s.ordersCount;
+  }
+  res.json({
+    ok: true,
+    app: APP_NAME,
+    startedAt: runtime.startedAt,
+    frontendUrl: FRONTEND_URL,
+    firebase: {
+      connected: firebaseState.connected,
+      source: firebaseState.source,
+      hasDatabaseUrl: !!FIREBASE_DATABASE_URL
+    },
+    mercadoPago: {
+      configured: !!MP_ACCESS_TOKEN
+    },
+    worker: runtime.worker,
+    stats
+  });
+});
+
+app.get('/api/server/status', async (req, res) => {
+  res.json({
+    ok: true,
+    serverName: 'Argos RJ',
+    online: true,
+    loginMode: 'Discord',
+    backend: req.protocol + '://' + req.get('host')
+  });
+});
+
+app.get('/auth/discord/url', async (req, res) => {
+  if(!DISCORD_CLIENT_ID){
+    return res.status(400).json({ error:'DISCORD_CLIENT_ID não configurado no backend.' });
+  }
+  const state = String(req.query.state || '');
+  const redirectUri = String(req.query.redirect_uri || DISCORD_REDIRECT_URI);
+  const url = await getDiscordAuthUrl(state, redirectUri);
+  res.json({ url, redirectUri });
+});
+
+app.post('/auth/discord/exchange', async (req, res) => {
+  try{
+    if(!DISCORD_CLIENT_ID || !DISCORD_CLIENT_SECRET){
+      return res.status(400).json({ error:'Credenciais do Discord não configuradas no backend.' });
+    }
+    const code = String(req.body.code || '');
+    const redirectUri = String(req.body.redirect_uri || DISCORD_REDIRECT_URI);
+    if(!code) return res.status(400).json({ error:'code ausente' });
+
+    const auth = await exchangeDiscordCode(code, redirectUri);
+    addLog('info', 'Login Discord concluído', { discordId: auth.user.id, username: auth.user.username });
+    res.json({ ok:true, user: auth.user });
+  }catch(err){
+    addLog('error', 'Falha no exchange do Discord', { error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/process-now', async (req, res) => {
+  try{
+    const summary = await processOrdersWorker();
+    res.json({ ok:true, summary });
+  }catch(err){
+    res.status(500).json({ ok:false, error: err.message });
+  }
+});
+
+app.post('/webhooks/mercadopago', async (req, res) => {
+  try{
+    addLog('info', 'Webhook Mercado Pago recebido', { body: req.body });
+
+    const topic = req.body.type || req.body.topic;
+    const paymentId = req.body.data?.id || req.body.id;
+
+    if(topic && paymentId && MP_ACCESS_TOKEN){
+      const paymentRes = await apiFetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+        headers: { Authorization:`Bearer ${MP_ACCESS_TOKEN}` }
+      });
+
+      if(paymentRes.res.ok && paymentRes.json){
+        const mp = paymentRes.json;
+        const externalRef = mp.external_reference;
+        const siteOrders = await dbGet('siteOrders');
+        if(siteOrders && externalRef){
+          for(const [discordId, bucket] of Object.entries(siteOrders)){
+            if(!bucket || typeof bucket !== 'object') continue;
+            for(const [orderId, order] of Object.entries(bucket)){
+              if(orderId === externalRef || order?.orderId === externalRef){
+                await dbUpdate(`siteOrders/${discordId}/${orderId}`, {
+                  status: mp.status || order.status || 'pending',
+                  payment: paymentFieldsFromMp(mp),
+                  updatedAt: new Date().toISOString()
+                });
+                addLog('info', 'Pedido atualizado por webhook', { discordId, orderId, paymentId });
+              }
+            }
+          }
         }
       }
     }
 
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    addLog('error', 'Erro no webhook Mercado Pago.', { error: err.message });
-    return res.status(200).json({ ok: true, ignored: true });
+    res.json({ ok:true });
+  }catch(err){
+    addLog('error', 'Erro no webhook Mercado Pago', { error: err.message });
+    res.status(500).json({ ok:false, error: err.message });
   }
 });
 
-app.get('/admin', (req, res) => {
-  res.send(`<!doctype html>
-<html lang="pt-BR">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Argos RJ • PIX Backend</title>
-<style>
-:root{
-  --bg:#0b1020;--panel:#11192d;--panel2:#0f1728;--line:rgba(255,255,255,.08);
-  --text:#eef3ff;--muted:#aab6d3;--accent:#ff8c2f;--ok:#29d17d;--bad:#ff5f6d;--warn:#ffd166;
-}
-*{box-sizing:border-box}
-body{margin:0;font-family:Inter,Arial,sans-serif;background:
-radial-gradient(circle at top right, rgba(53,86,173,.35), transparent 30%),
-radial-gradient(circle at top left, rgba(255,140,47,.12), transparent 25%),var(--bg);color:var(--text)}
-.top{display:flex;justify-content:space-between;align-items:center;padding:20px 28px;border-bottom:1px solid var(--line);background:rgba(11,16,32,.88);position:sticky;top:0}
-.wrap{max-width:1320px;margin:0 auto;padding:28px}
-.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px;margin-bottom:18px}
-.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:0 18px 50px rgba(0,0,0,.25)}
-.big{font-size:26px;font-weight:800}
-.muted{color:var(--muted)}
-.pre{white-space:pre-wrap;word-break:break-word;background:rgba(255,255,255,.03);border:1px solid var(--line);border-radius:14px;padding:14px;max-height:420px;overflow:auto}
-.toolbar{display:flex;gap:10px}
-.btn{background:var(--accent);color:#1a120b;border:0;padding:12px 16px;border-radius:12px;font-weight:800;cursor:pointer}
-.btn.alt{background:rgba(255,255,255,.06);color:var(--text);border:1px solid var(--line)}
-table{width:100%;border-collapse:collapse}
-th,td{padding:10px 12px;border-bottom:1px solid var(--line);text-align:left;font-size:14px;vertical-align:top}
-th{color:var(--muted)}
-.scroll{max-height:480px;overflow:auto}
-@media (max-width:1100px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media (max-width:700px){.grid{grid-template-columns:1fr}.top,.wrap{padding:16px}}
-</style>
-</head>
-<body>
-  <div class="top">
-    <div>
-      <div style="font-size:24px;font-weight:800">Argos RJ • Backend PIX</div>
-      <div class="muted">Mercado Pago + Firebase + monitoramento</div>
-    </div>
-    <div class="toolbar">
-      <button class="btn alt" id="refreshBtn">Atualizar</button>
-      <button class="btn" id="workerBtn">Rodar worker</button>
-    </div>
-  </div>
-
-  <div class="wrap">
-    <div class="grid">
-      <div class="card"><div class="muted">Backend</div><div id="backendBox" class="big">--</div></div>
-      <div class="card"><div class="muted">Firebase</div><div id="firebaseBox" class="big">--</div></div>
-      <div class="card"><div class="muted">Mercado Pago</div><div id="mpBox" class="big">--</div></div>
-      <div class="card"><div class="muted">Pedidos</div><div id="ordersBox" class="big">--</div></div>
-    </div>
-
-    <div class="card" style="margin-bottom:18px">
-      <div style="font-size:18px;font-weight:800;margin-bottom:10px">Worker</div>
-      <div id="workerBox" class="pre">Carregando...</div>
-    </div>
-
-    <div class="card" style="margin-bottom:18px">
-      <div style="font-size:18px;font-weight:800;margin-bottom:10px">Pedidos recentes</div>
-      <div class="scroll">
-        <table>
-          <thead><tr><th>Discord</th><th>Pedido</th><th>Status</th><th>Valor</th><th>Pagamento</th></tr></thead>
-          <tbody id="ordersTable"><tr><td colspan="5">Carregando...</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card">
-      <div style="font-size:18px;font-weight:800;margin-bottom:10px">Logs</div>
-      <div id="logsBox" class="pre">Carregando...</div>
-    </div>
-  </div>
-
-<script>
-async function loadStatus(){
-  const res = await fetch('/api/admin/status');
-  const data = await res.json();
-
-  document.getElementById('backendBox').textContent = data.backendOnline ? 'ONLINE' : 'OFF';
-  document.getElementById('firebaseBox').textContent = data.firebaseReady ? 'CONECTADO' : 'FALHOU';
-  document.getElementById('mpBox').textContent = data.mercadoPagoConfigured ? 'TOKEN OK' : 'FALTA TOKEN';
-  document.getElementById('ordersBox').textContent = (data.counts && data.counts.ordersCount != null) ? data.counts.ordersCount : '--';
-  document.getElementById('workerBox').textContent = JSON.stringify(data.worker, null, 2);
-  document.getElementById('logsBox').textContent = (data.logs || []).map(l => '[' + l.time + '] [' + l.level.toUpperCase() + '] ' + l.message + (l.extra ? ' ' + JSON.stringify(l.extra) : '')).join('\\n') || 'Sem logs.';
-
-  const rows = (data.recentOrders || []).map(row => {
-    const pay = row.payment && row.payment.id ? `PIX ${row.payment.id}` : '-';
-    const total = row.total || row.amount || row.price || '-';
-    return `<tr>
-      <td>${row.discordId || '-'}</td>
-      <td>${row.orderId || '-'}</td>
-      <td>${row.status || '-'}</td>
-      <td>${total}</td>
-      <td>${pay}</td>
-    </tr>`;
-  }).join('');
-  document.getElementById('ordersTable').innerHTML = rows || '<tr><td colspan="5">Sem pedidos.</td></tr>';
-}
-
-document.getElementById('refreshBtn').onclick = () => loadStatus();
-document.getElementById('workerBtn').onclick = async () => {
-  await fetch('/api/admin/run-worker', { method: 'POST' });
-  await loadStatus();
-};
-
-loadStatus();
-setInterval(loadStatus, 10000);
-</script>
-</body>
-</html>`);
+app.use((req, res) => {
+  res.status(404).type('html').send(pageTemplate('404', `
+    <div class="card"><h1>404</h1><p class="small">Rota não encontrada.</p><p><a class="btn" href="/">Voltar para a raiz</a></p></div>
+  `));
 });
 
-setInterval(() => {
-  runWorker().catch((err) => addLog('error', 'Worker loop falhou.', { error: err.message }));
-}, WORKER_INTERVAL_MS);
-
-app.listen(PORT, () => addLog('info', `Backend iniciado na porta ${PORT}.`));
+app.listen(PORT, () => {
+  addLog('info', `${APP_NAME} rodando`, { port: PORT });
+});
