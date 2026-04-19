@@ -1,5 +1,5 @@
 {
-  "name": "argos-rj-backend-render-root-admin-fix",
+  "name": "argos-backend-firebase-mercadopago",
   "version": "1.0.0",
   "private": true,
   "type": "commonjs",
@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "firebase-admin": "^12.1.1"
   }
 }

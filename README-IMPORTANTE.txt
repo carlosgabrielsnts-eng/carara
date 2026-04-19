@@ -1,16 +1,33 @@
-USE ESSE BACKEND NO RENDER
+BACKEND ARGOS RJ - FIREBASE + MERCADO PAGO
 
-O que ele faz:
-- "/" abre uma tela bonita
-- "/admin" abre o painel admin
-- "/api/health" mostra status em JSON
-- "/api/admin/status" mostra status detalhado
+Esse backend:
+- lê o Firebase Admin por Secret File
+- monitora pedidos em siteOrders/{discordId}/{orderId}
+- gera PIX no Mercado Pago via backend
+- grava qr_code, qr_code_base64 e payment.id no próprio Firebase
+- expõe painel em /admin
+- recebe webhook do Mercado Pago em /api/mercadopago/webhook
 
-Se continuar aparecendo 'Cannot GET /', então o Render ainda está rodando um projeto antigo ou a pasta errada.
+Estrutura esperada do pedido no Firebase:
+siteOrders/{discordId}/{orderId} = {
+  "status": "pending",
+  "total": 19.90,
+  "email": "cliente@email.com",
+  "description": "Caixa Mythica",
+  "items": [...]
+}
+
+O frontend deve:
+1. criar o pedido no Firebase
+2. esperar o backend gerar payment + QR
+3. ler de volta do mesmo pedido:
+   payment.qr_code
+   payment.qr_code_base64
+   payment.ticket_url
 
 No Render:
-1. Suba esta pasta
-2. Configure FIREBASE_DATABASE_URL
-3. Em Secret Files, adicione:
-   Nome: serviceAccount.json
-   Conteúdo: JSON completo da conta de serviço do Firebase
+- FIREBASE_DATABASE_URL
+- MP_ACCESS_TOKEN
+- MP_PUBLIC_KEY
+- MP_WEBHOOK_URL
+- Secret File: serviceAccount.json
