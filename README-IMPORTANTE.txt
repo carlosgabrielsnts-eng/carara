@@ -1,25 +1,16 @@
-ARGOS RJ BACKEND ADMIN MONITOR V2
+USE ESSE BACKEND NO RENDER
 
-Mudanças:
-- "/" redireciona para "/admin"
-- painel admin bonito com status, logs, pedidos e vínculos
-- "/api/health" e "/api/admin/status"
-- leitura automática do Secret File do Render em /etc/secrets/serviceAccount.json
+O que ele faz:
+- "/" abre uma tela bonita
+- "/admin" abre o painel admin
+- "/api/health" mostra status em JSON
+- "/api/admin/status" mostra status detalhado
 
-Como configurar no Render:
-1. Environment -> Secret Files
-2. Filename: serviceAccount.json
-3. Contents: cole o JSON COMPLETO original da conta de serviço do Firebase
-4. Environment Variables:
-   FIREBASE_DATABASE_URL=https://base-mods-97da8-default-rtdb.firebaseio.com
-   PORT=3000
-   WORKER_INTERVAL_MS=10000
+Se continuar aparecendo 'Cannot GET /', então o Render ainda está rodando um projeto antigo ou a pasta errada.
 
-Rotas:
-- /
-- /admin
-- /api/health
-- /api/admin/status
-
-No frontend, use a callback:
-http://argosrj.netlify.app/auth/discord/callback
+No Render:
+1. Suba esta pasta
+2. Configure FIREBASE_DATABASE_URL
+3. Em Secret Files, adicione:
+   Nome: serviceAccount.json
+   Conteúdo: JSON completo da conta de serviço do Firebase
